@@ -1,0 +1,33 @@
+interface Identifiable {
+  id: number;
+}
+
+class GenericService<T extends Identifiable> {
+  private items: T[] = [];
+
+  create(item: T): void {
+    this.items.push(item);
+  }
+
+  getAll(): T[] {
+    return this.items;
+  }
+
+  getById(id: number): T | undefined {
+    return this.items.find(item => item.id === id);
+  }
+
+  update(id: number, updatedItem: T): boolean {
+    const index = this.items.findIndex(item => item.id === id);
+    if (index === -1) return false;
+    this.items[index] = updatedItem;
+    return true;
+  }
+
+  delete(id: number): boolean {
+    const index = this.items.findIndex(item => item.id === id);
+    if (index === -1) return false;
+    this.items.splice(index, 1);
+    return true;
+  }
+}

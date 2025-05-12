@@ -1,143 +1,156 @@
-"use strict";
-var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
-    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-    return new (P || (P = Promise))(function (resolve, reject) {
-        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
+import express, { Request, Response } from 'express';
+import multer from 'multer';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import dotenv from 'dotenv';
+import { Worker } from 'worker_threads';
+import path from 'path';
+import { S3DownloadError, ProcessingError } from './error';
+import { WorkerResult, RecordData } from './types';
+
+dotenv.config();
+
+const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
+
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+  },
+});
+
+const processChunkWithWorker = (dataChunk: RecordData[]): Promise<WorkerResult[]> => {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(path.resolve(__dirname, 'worker.js'), {
+      workerData: dataChunk,
     });
-};
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-const express_1 = __importDefault(require("express"));
-const multer_1 = __importDefault(require("multer"));
-const client_s3_1 = require("@aws-sdk/client-s3");
-const s3_request_presigner_1 = require("@aws-sdk/s3-request-presigner");
-const dotenv_1 = __importDefault(require("dotenv"));
-const worker_threads_1 = require("worker_threads");
-const path_1 = __importDefault(require("path"));
-const error_1 = require("./error");
-dotenv_1.default.config();
-const app = (0, express_1.default)();
-const upload = (0, multer_1.default)({ storage: multer_1.default.memoryStorage() });
-const s3 = new client_s3_1.S3Client({
-    region: process.env.AWS_REGION,
-    credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-    },
-});
-const processChunkWithWorker = (dataChunk) => {
-    return new Promise((resolve, reject) => {
-        const worker = new worker_threads_1.Worker(path_1.default.resolve(__dirname, 'worker.js'), {
-            workerData: dataChunk,
-        });
-        worker.on('message', resolve);
-        worker.on('error', (err) => reject(new error_1.ProcessingError(`Worker error: ${err.message}`)));
-        worker.on('exit', (code) => {
-            if (code !== 0)
-                reject(new error_1.ProcessingError(`Worker stopped with exit code ${code}`));
-        });
+
+    worker.on('message', resolve);
+    worker.on('error', (err) => reject(new ProcessingError(`Worker error: ${err.message}`)));
+    worker.on('exit', (code) => {
+      if (code !== 0) reject(new ProcessingError(`Worker stopped with exit code ${code}`));
     });
+  });
 };
-const retry = (fn_1, ...args_1) => __awaiter(void 0, [fn_1, ...args_1], void 0, function* (fn, retries = 3, delay = 500) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            return yield fn();
-        }
-        catch (err) {
-            if (i === retries - 1)
-                throw err;
-            yield new Promise((res) => setTimeout(res, delay * 2 ** i));
-        }
-    }
-    throw new Error('Unreachable');
-});
-app.post('/upload', upload.single('file'), (req, res) => {
-    (() => __awaiter(void 0, void 0, void 0, function* () {
-        const file = req.file;
-        if (!file) {
-            res.status(400).json({ error: 'No file uploaded' });
-            return;
-        }
-        try {
-            const fileContent = JSON.parse(file.buffer.toString());
-            const chunkSize = 2000;
-            const chunks = [];
-            for (let i = 0; i < fileContent.length; i += chunkSize) {
-                chunks.push(fileContent.slice(i, i + chunkSize));
-            }
-            const processedChunks = yield Promise.all(chunks.map(processChunkWithWorker));
-            const successes = [];
-            const failures = [];
-            const processedData = processedChunks.flat();
-            processedData.forEach((result) => {
-                if (result.success) {
-                    successes.push(result.record); // fixed undefined issue here too
-                }
-                else {
-                    failures.push(result.error);
-                }
-            });
-            const fileName = `${Date.now()}-${file.originalname}`;
-            const uploadParams = {
-                Bucket: process.env.S3_BUCKET_NAME,
-                Key: fileName,
-                Body: JSON.stringify(processedData),
-                ContentType: file.mimetype,
-            };
-            yield s3.send(new client_s3_1.PutObjectCommand(uploadParams));
-            console.log(`${successes.length} records processed successfully`);
-            console.log(`${failures.length} records failed`);
-            //   failures.forEach((err, idx) => {
-            //     console.log(`${idx + 1}. [${err.name}] ${err.message}`);
-            //   });
-            res.json({
-                message: 'File uploaded with processing report',
-                successfulRecords: successes.length,
-                failedRecords: failures.length,
-                errors: failures.slice(0, 5),
-            });
-        }
-        catch (error) {
-            console.error('Upload error:', error);
-            res.status(500).json({ error: 'Upload failed', reason: error.message });
-        }
-    }))();
-});
-app.get('/download/:key', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+
+const retry = async <T>(fn: () => Promise<T>, retries = 3, delay = 500): Promise<T> => {
+  for (let i = 0; i < retries; i++) {
     try {
-        const key = req.params.key;
-        const command = new client_s3_1.GetObjectCommand({
-            Bucket: process.env.S3_BUCKET_NAME,
-            Key: key,
-        });
-        const url = yield retry(() => (0, s3_request_presigner_1.getSignedUrl)(s3, command, { expiresIn: 60 }));
-        res.json({ downloadUrl: url });
+      return await fn();
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await new Promise((res) => setTimeout(res, delay * 2 ** i));
     }
-    catch (error) {
-        console.error('Download failed:', error);
-        res.status(500).json({
-            error: new error_1.S3DownloadError(`Failed to generate download URL: ${error.message}`).message,
-        });
+  }
+  throw new Error('Unreachable');
+};
+
+app.post('/upload', upload.single('file'), (req: Request, res: Response) => {
+  (async () => {
+    const file = req.file;
+    if (!file) {
+      res.status(400).json({ error: 'No file uploaded' });
+      return;
     }
-}));
-app.listen(3000, () => {
-    console.log('Server is running on http://localhost:3000');
+
+    try {
+      const fileContent: RecordData[] = JSON.parse(file.buffer.toString());
+
+      const chunkSize = 2000;
+      const chunks: RecordData[][] = [];
+      for (let i = 0; i < fileContent.length; i += chunkSize) {
+        chunks.push(fileContent.slice(i, i + chunkSize));
+      }
+
+      const processedChunks = await Promise.all(chunks.map(processChunkWithWorker));
+
+      const successes: RecordData[] = [];
+      const failures: any[] = [];
+
+      const processedData = processedChunks.flat();
+
+      processedData.forEach((result) => {
+        if (result.success) {
+          successes.push(result.record!); // fixed undefined issue here too
+        } else {
+          failures.push(result.error);
+        }
+      });
+
+      const fileName = `${Date.now()}-${file.originalname}`;
+      const uploadParams = {
+        Bucket: process.env.S3_BUCKET_NAME!,
+        Key: fileName,
+        Body: JSON.stringify(processedData),
+        ContentType: file.mimetype,
+      };
+
+      await s3.send(new PutObjectCommand(uploadParams));
+
+      console.log(`${successes.length} records processed successfully`);
+      console.log(`${failures.length} records failed`);
+
+    //   failures.forEach((err, idx) => {
+    //     console.log(`${idx + 1}. [${err.name}] ${err.message}`);
+    //   });
+
+      res.json({
+        message: 'File uploaded with processing report',
+        successfulRecords: successes.length,
+        failedRecords: failures.length,
+        errors: failures.slice(0, 5),
+      });
+    } catch (error: any) {
+      console.error('Upload error:', error);
+      res.status(500).json({ error: 'Upload failed', reason: error.message });
+    }
+  })();
 });
+
+
+app.get('/download/:key', async (req: Request, res: Response) => {
+  try {
+    const key = req.params.key;
+    const command = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME!,
+      Key: key,
+    });
+
+    const url = await retry(() => getSignedUrl(s3, command, { expiresIn: 60 }));
+    res.json({ downloadUrl: url });
+  } catch (error: any) {
+    console.error('Download failed:', error);
+    res.status(500).json({
+      error: new S3DownloadError(`Failed to generate download URL: ${error.message}`).message,
+    });
+  }
+});
+
+app.listen(3000, () => {
+  console.log('Server is running on http://localhost:3000');
+});
+
+
+
+
+
 // const express = require('express');
 // const multer = require('multer');
 // const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 // const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 // const dotenv = require('dotenv');
+
 // const { Worker } = require('worker_threads');
 // const path = require('path');
 // const fs = require('fs');
+
 // const { S3DownloadError, ProcessingError } = require('./error.js');
+
+
 // dotenv.config();
+
 // const app = express();
 // const upload = multer({
 //     storage: multer.memoryStorage(),
@@ -148,6 +161,7 @@ app.listen(3000, () => {
 //     //     cb(null, true);
 //     //   }
 // });
+
 // // AWS S3 client setup
 // const s3 = new S3Client({
 //     region: process.env.AWS_REGION,
@@ -156,41 +170,52 @@ app.listen(3000, () => {
 //         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
 //     },
 // });
+
 // // Function to process data in worker threads
 // const processChunkWithWorker = (dataChunk) => {
 //     return new Promise((resolve, reject) => {
 //         const worker = new Worker(path.resolve(__dirname, 'worker.js'), {
 //             workerData: dataChunk,   // Pass data chunk to worker
 //         });
+
 //         worker.on('message', resolve);
+
 //         //error handling 3
 //         worker.on('error', (err) => {
 //             reject(new ProcessingError(`Worker error: ${err.message}`));
 //         });
+
 //         worker.on('exit', (code) => {
 //             if (code !== 0) reject(new ProcessingError(`Worker stopped with exit code ${code}`));
 //         });
 //     });
 // };
+
 // // Upload endpoint
 // app.post('/upload', upload.single('file'), async (req, res) => {
 //     const file = req.file;
+
+
 //     try {
 //         // Parse the JSON file (convert buffer to string and parse)
 //         const fileContent = JSON.parse(file.buffer.toString());
+
 //         // Split the data into 10 chunks (each with 2000 records)
 //         const chunkSize = 2000;
 //         const chunks = [];
 //         for (let i = 0; i < fileContent.length; i += chunkSize) {
 //             chunks.push(fileContent.slice(i, i + chunkSize));
 //         }
+
 //         // Process each chunk with a worker thread
 //         const processedChunks = await Promise.all(chunks.map(processChunkWithWorker));
+
 //         const successes = [];
 //         const failures = [];
 //         // console.log("*****");
 //         // Combine all processed chunks
 //         const processedData = processedChunks.flat();   // Flatten the array of processed data
+
 //         processedData.forEach(result => {
 //             if (result.success) {
 //                 successes.push(result.data);
@@ -198,6 +223,7 @@ app.listen(3000, () => {
 //                 failures.push(result.error);
 //             }
 //         });
+
 //         // 
 //         // Simulate uploading the processed data to S3
 //         const fileName = `${Date.now()}-${file.originalname}`;
@@ -207,6 +233,7 @@ app.listen(3000, () => {
 //         //     Body: JSON.stringify(processedData),  // Save processed data
 //         //     ContentType: 'application/json',
 //         // };
+
 //         const uploadParams = {
 //             Bucket: process.env.S3_BUCKET_NAME,
 //             Key: fileName,
@@ -214,23 +241,28 @@ app.listen(3000, () => {
 //             Body: JSON.stringify(processedData),
 //             ContentType: file.mimetype,
 //         };
+
 //             await s3.send(new PutObjectCommand(uploadParams));
 //             console.log(` ${successes.length} records processed successfully`);
 //             console.log(` ${failures.length} records failed`);
+
 //         failures.forEach((err, idx) => {
 //             console.log(`  ${idx + 1}. [${err.type}] ${err.message}`);
 //         });
+
 //         res.json({
 //             message: 'File uploaded with processing report',
 //             successfulRecords: successes.length,
 //             failedRecords: failures.length,
 //             errors: failures.slice(0, 5), // Send top 5 errors to client
 //         });
+
 //     } catch (error) {
 //         console.error('Upload error:', error);
 //         res.status(500).json({ error: 'Upload failed', reason: error.message });
 //     }
 // });
+
 // // Download endpoint
 // // Helper function: retry with exponential backoff
 // const retry = async (fn, retries = 3, delay = 500) => {
@@ -243,30 +275,41 @@ app.listen(3000, () => {
 //         }
 //     }
 // };
+
 // app.get('/download/:key', async (req, res) => {
 //     const key = req.params.key;
+
 //     try {
 //         const command = new GetObjectCommand({
 //             Bucket: process.env.S3_BUCKET_NAME,
 //             Key: key,
 //         });
+
 //         // Retry getSignedUrl up to 3 times
 //         const url = await retry(() =>
 //             getSignedUrl(s3, command, { expiresIn: 60 })
 //         );
+
 //         res.json({ downloadUrl: url });
+
 //     } catch (error) {
 //         console.error('Download failed:', error);
 //      const err = new S3DownloadError(`Failed to generate download URL: ${error.message}`);
+
 //         res.status(500).json({ error:err.message});
 //     }
 // });
+
+
+
 // // app.get('/download/:key', async (req, res) => {
 // //     const key = req.params.key;
+
 // //     const getObjectParams = {
 // //         Bucket: process.env.S3_BUCKET_NAME,
 // //         Key: key,
 // //     };
+
 // //     try {
 // //         const command = new GetObjectCommand(getObjectParams);
 // //         const url = await getSignedUrl(s3, command, { expiresIn: 60 }); // 1 min
@@ -274,10 +317,17 @@ app.listen(3000, () => {
 // //     } catch (error) {
 // //         console.error('Download error:', error);
 // //         const err = new S3DownloadError(`Failed to generate download URL: ${error.message}`);
+
 // //         res.status(500).json({ error: err.message });
 // //     }
 // // });
+
 // // Start server
 // app.listen(3000, () => {
 //     console.log('Server running at http://localhost:3000');
 // });
+
+
+
+
+

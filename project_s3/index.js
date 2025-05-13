@@ -1,4 +1,37 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -20,6 +53,8 @@ const dotenv_1 = __importDefault(require("dotenv"));
 const worker_threads_1 = require("worker_threads");
 const path_1 = __importDefault(require("path"));
 const error_1 = require("./error");
+const https = __importStar(require("https"));
+const fs = __importStar(require("fs"));
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const upload = (0, multer_1.default)({ storage: multer_1.default.memoryStorage() });
@@ -92,9 +127,9 @@ app.post('/upload', upload.single('file'), (req, res) => {
             yield s3.send(new client_s3_1.PutObjectCommand(uploadParams));
             console.log(`${successes.length} records processed successfully`);
             console.log(`${failures.length} records failed`);
-            //   failures.forEach((err, idx) => {
-            //     console.log(`${idx + 1}. [${err.name}] ${err.message}`);
-            //   });
+            failures.forEach((err, idx) => {
+                console.log(`${idx + 1}. [${err.name}] ${err.message}`);
+            });
             res.json({
                 message: 'File uploaded with processing report',
                 successfulRecords: successes.length,
@@ -116,6 +151,22 @@ app.get('/download/:key', (req, res) => __awaiter(void 0, void 0, void 0, functi
             Key: key,
         });
         const url = yield retry(() => (0, s3_request_presigner_1.getSignedUrl)(s3, command, { expiresIn: 60 }));
+        //***
+        const file = fs.createWriteStream('downloaded.json');
+        https.get(url, (response) => {
+            if (response.statusCode !== 200) {
+                console.error(`Failed to download file. Status: ${response.statusCode}`);
+                return;
+            }
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                console.log('Download completed!');
+            });
+        }).on('error', (err) => {
+            console.error('Error during download:', err.message);
+        });
+        //***
         res.json({ downloadUrl: url });
     }
     catch (error) {

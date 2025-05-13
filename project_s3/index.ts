@@ -8,6 +8,10 @@ import path from 'path';
 import { S3DownloadError, ProcessingError } from './error';
 import { WorkerResult, RecordData } from './types';
 
+
+import * as https from 'https';
+import * as fs from 'fs';
+
 dotenv.config();
 
 const app = express();
@@ -92,9 +96,9 @@ app.post('/upload', upload.single('file'), (req: Request, res: Response) => {
       console.log(`${successes.length} records processed successfully`);
       console.log(`${failures.length} records failed`);
 
-    //   failures.forEach((err, idx) => {
-    //     console.log(`${idx + 1}. [${err.name}] ${err.message}`);
-    //   });
+      failures.forEach((err, idx) => {
+        console.log(`${idx + 1}. [${err.name}] ${err.message}`);
+      });
 
       res.json({
         message: 'File uploaded with processing report',
@@ -119,6 +123,29 @@ app.get('/download/:key', async (req: Request, res: Response) => {
     });
 
     const url = await retry(() => getSignedUrl(s3, command, { expiresIn: 60 }));
+
+    //***Download file 
+
+const file = fs.createWriteStream('downloaded.json');
+
+https.get(url, (response) => {
+  if (response.statusCode !== 200) {
+    console.error(`Failed to download file. Status: ${response.statusCode}`);
+    return;
+  }
+
+  response.pipe(file);
+  file.on('finish', () => {
+    file.close();
+    console.log('Download completed!');
+  });
+}).on('error', (err) => {
+  console.error('Error during download:', err.message);
+});
+
+//***
+
+
     res.json({ downloadUrl: url });
   } catch (error: any) {
     console.error('Download failed:', error);
@@ -131,6 +158,12 @@ app.get('/download/:key', async (req: Request, res: Response) => {
 app.listen(3000, () => {
   console.log('Server is running on http://localhost:3000');
 });
+
+
+
+
+
+
 
 
 
